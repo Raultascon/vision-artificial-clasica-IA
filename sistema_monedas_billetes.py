@@ -45,21 +45,21 @@ class ConfiguracionSistema:
     px_por_mm: float = 2.16
 
     # --- Segmentación del tapete verde en espacio HSV (OpenCV: H en [0,180]) ---
-    hsv_verde_min: Tuple[int, int, int] = (34, 40, 35)
-    hsv_verde_max: Tuple[int, int, int] = (88, 255, 255)
+    hsv_verde_min: Tuple[int, int, int] = (33, 26, 22)
+    hsv_verde_max: Tuple[int, int, int] = (90, 255, 255)
 
     # --- Filtros de área física (en mm^2) para descartar ruido o intrusos ---
     # Moneda más pequeña: 1c (207.4 mm^2). Billete más grande: 50€ (10780 mm^2)
-    area_min_objeto_mm2: float = 140.0
-    area_max_objeto_mm2: float = 13500.0
+    area_min_objeto_mm2: float = 130.0
+    area_max_objeto_mm2: float = 16500.0
 
     # --- Nodo Raíz: Geometría Global (Moneda vs Billete vs Solapamiento) ---
-    umbral_circularidad_moneda: float = 0.78     # Círculo ideal = 1.0; Rectángulo ~ 0.62
+    umbral_circularidad_moneda: float = 0.76     # Círculo ideal = 1.0; Rectángulo ~ 0.62
     umbral_aspect_ratio_moneda: float = 1.22     # Moneda ~ 1.00 - 1.12
-    umbral_solidez_minima: float = 0.91          # < 0.91 indica dos monedas tocándose
-    aspect_ratio_billete_min: float = 1.65       # Billetes reales: 1.82 a 1.94
-    aspect_ratio_billete_max: float = 2.15
-    rectangularidad_billete_min: float = 0.84    # Área / (W_rot * H_rot)
+    umbral_solidez_minima: float = 0.88          # < 0.88 con AR > 1.25 indica monedas tocándose
+    aspect_ratio_billete_min: float = 1.48       # Soporta billetes reales incluso con dobleces (1.50 a 2.15)
+    aspect_ratio_billete_max: float = 2.20
+    rectangularidad_billete_min: float = 0.78    # Área / (W_rot * H_rot)
 
     # --- Sub-árbol de Monedas: Análisis Zonal (Núcleo vs Corona en CIELAB) ---
     # En OpenCV Lab, a* y b* están desplazados +128 (neutro = 128.0)
@@ -83,12 +83,17 @@ class ConfiguracionSistema:
     umbral_area_20c_50c_mm2: float = 425.3
     area_max_oro_mm2: float = 515.0
 
-    # --- Sub-árbol de Billetes: Color HSV/Lab + Lado Mayor (mm) ---
-    # 5€ (120x62mm, gris), 10€ (127x67mm, rojo), 20€ (133x72mm, azul), 50€ (140x77mm, naranja)
+    # --- Sub-árbol de Billetes: Color HSV/Lab + Dimensiones Físicas (mm y mm^2) ---
+    # 5€ (120x62mm, 7440mm², gris), 10€ (127x67mm, 8509mm², rojo),
+    # 20€ (133x72mm, 9576mm², azul), 50€ (140x77mm, 10780mm², naranja)
     umbral_saturacion_5e_gris: float = 48.0      # 5€ presenta saturación muy baja
-    hue_azul_20e_min: int = 92                   # Rango H para azul en OpenCV (92 - 132)
-    hue_azul_20e_max: int = 132
-    umbral_lab_a_10e_vs_50e: float = 141.0       # 10€ (rojo) tiene mayor a* que 50€ (naranja)
+    hue_azul_20e_min: int = 88                   # Rango H para azul en OpenCV (88 - 136)
+    hue_azul_20e_max: int = 136
+    umbral_lab_a_20e_max: float = 130.5          # El billete azul de 20€ tiene a* bajo/neutro (<= 130.5) incluso bajo luz cálida
+    umbral_lab_a_10e_vs_50e: float = 139.0       # 10€ (rojo) tiene mayor a* que 50€ (naranja)
+    umbral_lado_5e_10e_mm: float = 123.5         # Punto medio entre 120 mm (5€) y 127 mm (10€)
+    umbral_lado_10e_20e_mm: float = 130.0        # Punto medio entre 127 mm (10€) y 133 mm (20€)
+    umbral_lado_20e_50e_mm: float = 136.5        # Punto medio entre 133 mm (20€) y 140 mm (50€)
     umbral_lado_10e_50e_mm: float = 133.5        # Punto medio entre 127 mm (10€) y 140 mm (50€)
 
 
@@ -141,13 +146,34 @@ class ResultadoClasificacion:
 # ==============================================================================
 # 3. ETAPA 1 Y 2: PREPROCESAMIENTO Y SEGMENTACIÓN CLÁSICA
 # ==============================================================================
+def _es_contorno_borde_caja(cnt: np.ndarray, w_img: int, h_img: int) -> bool:
+    """
+    Descarta contornos espurios que tocan el borde exterior del fotograma y
+    abarcan una franja amplia (ej. paredes de caja de cartón o mesa alrededor del tapete).
+    """
+    x, y, w, h = cv2.boundingRect(cnt)
+    margen = 4
+    toca_borde = (
+        x <= margen or y <= margen or
+        (x + w) >= (w_img - margen) or (y + h) >= (h_img - margen)
+    )
+    if not toca_borde:
+        return False
+    # Si toca el borde de la foto y mide más del 12% del ancho/alto o está pegado al margen
+    if w >= 0.12 * w_img or h >= 0.12 * h_img:
+        return True
+    if x <= 2 or y <= 2 or (x + w) >= (w_img - 2) or (y + h) >= (h_img - 2):
+        return True
+    return False
+
+
 def segmentar_escena(
     img_bgr: np.ndarray,
     cfg: ConfiguracionSistema
 ) -> Tuple[np.ndarray, List[np.ndarray]]:
     """
     Aplica preprocesamiento, segmentación por color en espacio HSV para aislar
-    el fondo del tapete verde mate, filtrado morfológico y relleno de huecos.
+    el fondo del tapete verde mate, filtrado morfológico adaptativo y relleno de huecos.
 
     Parámetros:
         img_bgr: Imagen de entrada en formato BGR (OpenCV).
@@ -157,8 +183,15 @@ def segmentar_escena(
         mascara_objetos: Máscara binaria depurada con los objetos en blanco (255).
         contornos_validos: Lista de contornos externos filtrados por área mínima.
     """
+    h_img, w_img = img_bgr.shape[:2]
+    # Escalar suavizado y kernels morfológicos según la resolución de la foto
+    factor_res = max(1.0, min(h_img, w_img) / 1080.0)
+    k_blur = min(15, int(round(5 * factor_res)) | 1)
+    k_open_sz = min(15, int(round(5 * factor_res)) | 1)
+    k_close_sz = min(25, int(round(9 * factor_res)) | 1)
+
     # 1. Suavizado Gaussiano para atenuar la textura fibrosa del fieltro verde
-    img_suavizada = cv2.GaussianBlur(img_bgr, (5, 5), 0)
+    img_suavizada = cv2.GaussianBlur(img_bgr, (k_blur, k_blur), 0)
 
     # 2. Conversión al espacio HSV y umbralización del tapete verde
     img_hsv = cv2.cvtColor(img_suavizada, cv2.COLOR_BGR2HSV)
@@ -174,8 +207,8 @@ def segmentar_escena(
     # 4. Operaciones morfológicas:
     #    - Apertura (OPEN) para eliminar motas blancas de polvo sobre el tapete
     #    - Cierre (CLOSE) para unir grietas producidas por reflejos o bandas holográficas
-    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_open_sz, k_open_sz))
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_close_sz, k_close_sz))
     mascara_limpia = cv2.morphologyEx(mascara_cruda, cv2.MORPH_OPEN, kernel_open)
     mascara_limpia = cv2.morphologyEx(mascara_limpia, cv2.MORPH_CLOSE, kernel_close)
 
@@ -189,6 +222,8 @@ def segmentar_escena(
     escala_area = cfg.px_por_mm ** 2
 
     for cnt in contornos:
+        if _es_contorno_borde_caja(cnt, w_img, h_img):
+            continue
         area_px = cv2.contourArea(cnt)
         area_mm2 = area_px / escala_area
 
@@ -220,11 +255,15 @@ def extraer_caracteristicas(
     area_px = float(cv2.contourArea(contorno))
     area_mm2 = area_px / escala_area
 
-    perimetro_px = float(cv2.arcLength(contorno, True))
+    perimetro_raw_px = float(cv2.arcLength(contorno, True))
+    # Suavizado poligonal relativo (0.8% del perímetro) para evitar que la micro-fibra
+    # del fieltro en fotos de muy alta resolución (12MP-200MP) distorsione el perímetro
+    cnt_suave = cv2.approxPolyDP(contorno, 0.008 * perimetro_raw_px, True)
+    perimetro_px = float(cv2.arcLength(cnt_suave, True))
     perimetro_mm = perimetro_px / escala_lin
 
-    # Circularidad de Cox: C = 4 * pi * A / P^2 (1.0 en círculo perfecto)
-    circularidad = (4.0 * np.pi * area_px) / (perimetro_px ** 2 + 1e-6)
+    # Circularidad de Cox sobre contorno regularizado: C = 4 * pi * A / P^2
+    circularidad = min(1.0, (4.0 * np.pi * area_px) / (perimetro_px ** 2 + 1e-6))
 
     # Momentos y Centroide
     momentos = cv2.moments(contorno)
@@ -260,7 +299,7 @@ def extraer_caracteristicas(
 
     # Erosión del 12% para evitar píxeles contaminados por el borde del tapete verde
     r_eq_px = np.sqrt(area_px / np.pi)
-    k_erosion = max(3, int(0.12 * r_eq_px) | 1)
+    k_erosion = max(3, min(31, int(0.12 * r_eq_px) | 1))
     kernel_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_erosion, k_erosion))
     mascara_interior = cv2.erode(mascara_local, kernel_erode)
     if np.count_nonzero(mascara_interior) < 10:
@@ -282,9 +321,15 @@ def extraer_caracteristicas(
     pix_hsv = roi_hsv[mascara_interior > 0]
     pix_lab = roi_lab[mascara_interior > 0]
 
-    hue_med = float(np.median(pix_hsv[:, 0]))
     sat_med = float(np.median(pix_hsv[:, 1]))
     val_med = float(np.median(pix_hsv[:, 2]))
+    # Para el tono (Hue), priorizar píxeles cromáticos (S >= 28) si existen suficientes,
+    # evitando que el papel blanco/crema de los billetes sesgue la mediana de H
+    mask_crom = pix_hsv[:, 1] >= 28
+    if np.count_nonzero(mask_crom) >= 0.20 * len(pix_hsv):
+        hue_med = float(np.median(pix_hsv[mask_crom, 0]))
+    else:
+        hue_med = float(np.median(pix_hsv[:, 0]))
 
     lab_a_int = float(np.median(pix_lab[:, 1]))
     lab_b_int = float(np.median(pix_lab[:, 2]))
@@ -353,24 +398,33 @@ def clasificar_objeto_arbol(
 
         # ----------------------------------------------------------------------
         # NODO 2 (MONEDAS): Contraste Radial Núcleo-Corona (¿Es Bimetálica?)
+        # Incluye recuperación ante deslumbramiento por flash (interior plateado S<35 y b*<136.5)
         # ----------------------------------------------------------------------
-        if abs(f.delta_b_radial) >= cfg.umbral_gradiente_bimetalico_b and f.area_mm2 >= 380.0:
-            ruta.append(f"N2: |Δb*_radial|={abs(f.delta_b_radial):.1f}>={cfg.umbral_gradiente_bimetalico_b} -> BIMETÁLICA")
+        es_bimet_gradiente = abs(f.delta_b_radial) >= cfg.umbral_gradiente_bimetalico_b and f.area_mm2 >= 370.0
+        es_bimet_plata_flash = (
+            375.0 <= f.area_mm2 <= 585.0 and
+            f.sat_mediana < 35.0 and
+            f.lab_b_interior < 136.5 and
+            f.lab_a_interior < 135.0
+        )
+
+        if es_bimet_gradiente or es_bimet_plata_flash:
+            ruta.append(f"N2: |Δb*_radial|={abs(f.delta_b_radial):.1f} / Plata-Oro -> BIMETÁLICA")
 
             # NODO 3A: Signo del gradiente radial + Verificación de Área (1€ vs 2€)
-            if f.delta_b_radial < 0 and f.area_mm2 < cfg.umbral_area_1e_vs_2e_mm2:
-                ruta.append(f"N3A: Δb*<0 (Corona Oro) y A={f.area_mm2:.0f}<{cfg.umbral_area_1e_vs_2e_mm2:.0f} -> 1€")
+            if f.delta_b_radial <= -4.0 and f.area_mm2 < 500.0:
+                ruta.append(f"N3A: Δb*={f.delta_b_radial:+.1f}<0 (Corona Oro) -> 1€")
                 return ResultadoClasificacion(f.id_objeto, "MONEDA", "1.00 EUR", 100, ruta, f)
-            elif f.delta_b_radial > 0 and f.area_mm2 >= cfg.umbral_area_1e_vs_2e_mm2:
-                ruta.append(f"N3A: Δb*>0 (Núcleo Oro) y A={f.area_mm2:.0f}>={cfg.umbral_area_1e_vs_2e_mm2:.0f} -> 2€")
+            elif f.delta_b_radial >= 4.0 and f.area_mm2 >= 445.0:
+                ruta.append(f"N3A: Δb*={f.delta_b_radial:+.1f}>0 (Núcleo Oro) -> 2€")
                 return ResultadoClasificacion(f.id_objeto, "MONEDA", "2.00 EUR", 200, ruta, f)
             else:
-                # Desempate por área si un reflejo atenúa parcialmente el signo
+                # Desempate por área si un reflejo de flash atenúa el signo radial
                 if f.area_mm2 < cfg.umbral_area_1e_vs_2e_mm2:
-                    ruta.append(f"N3A(Aux): A={f.area_mm2:.0f}<{cfg.umbral_area_1e_vs_2e_mm2:.0f} -> 1€")
+                    ruta.append(f"N3A(Aux): A={f.area_mm2:.0f}<{cfg.umbral_area_1e_vs_2e_mm2:.0f}mm² -> 1€")
                     return ResultadoClasificacion(f.id_objeto, "MONEDA", "1.00 EUR", 100, ruta, f)
                 else:
-                    ruta.append(f"N3A(Aux): A={f.area_mm2:.0f}>={cfg.umbral_area_1e_vs_2e_mm2:.0f} -> 2€")
+                    ruta.append(f"N3A(Aux): A={f.area_mm2:.0f}>={cfg.umbral_area_1e_vs_2e_mm2:.0f}mm² -> 2€")
                     return ResultadoClasificacion(f.id_objeto, "MONEDA", "2.00 EUR", 200, ruta, f)
 
         else:
@@ -388,6 +442,7 @@ def clasificar_objeto_arbol(
                 ruta.append(f"N3B: a*={f.lab_a_interior:.1f} / Ratio={f.ratio_cobre_oro:.2f} -> FAMILIA COBRE")
 
                 # NODO 4A: Clasificación por Área dentro de Familia Cobre (1c, 2c, 5c)
+                # Nota: si A in [415, 525] mm², físicamente solo puede ser 50c bajo luz cálida
                 if f.area_mm2 < cfg.umbral_area_1c_2c_mm2:
                     ruta.append(f"N4A: A={f.area_mm2:.0f}<{cfg.umbral_area_1c_2c_mm2:.0f}mm² -> 1 céntimo")
                     return ResultadoClasificacion(f.id_objeto, "MONEDA", "0.01 EUR", 1, ruta, f)
@@ -397,15 +452,25 @@ def clasificar_objeto_arbol(
                 elif f.area_mm2 <= cfg.area_max_cobre_mm2:
                     ruta.append(f"N4A: A={f.area_mm2:.0f}>={cfg.umbral_area_2c_5c_mm2:.0f}mm² -> 5 céntimos")
                     return ResultadoClasificacion(f.id_objeto, "MONEDA", "0.05 EUR", 5, ruta, f)
+                elif f.area_mm2 <= cfg.area_max_oro_mm2:
+                    ruta.append(f"N4A(Luz Cálida): A={f.area_mm2:.0f}>415mm² (rango exclusivo 50c) -> 50 céntimos")
+                    return ResultadoClasificacion(f.id_objeto, "MONEDA", "0.50 EUR", 50, ruta, f)
                 else:
-                    ruta.append(f"N4A: Área fuera de rango cobre ({f.area_mm2:.0f}mm²) -> INTRUSO")
+                    ruta.append(f"N4A: Área fuera de rango ({f.area_mm2:.0f}mm²) -> INTRUSO")
                     return ResultadoClasificacion(f.id_objeto, "INTRUSO", "INTRUSO (Cobre > 5c)", 0, ruta, f)
 
             else:
                 ruta.append(f"N3B: b*={f.lab_b_interior:.1f} dominante -> FAMILIA ORO NÓRDICO")
 
                 # NODO 4B: Clasificación por Área dentro de Familia Oro (10c, 20c, 50c)
-                if f.area_mm2 < cfg.area_min_oro_mm2 or f.area_mm2 > cfg.area_max_oro_mm2:
+                # Nota: si A < 260 mm², físicamente solo puede ser 1c o 2c bajo luz fría/brillo
+                if f.area_mm2 < cfg.umbral_area_1c_2c_mm2:
+                    ruta.append(f"N4B(Brillo): A={f.area_mm2:.0f}<241.7mm² (rango exclusivo 1c) -> 1 céntimo")
+                    return ResultadoClasificacion(f.id_objeto, "MONEDA", "0.01 EUR", 1, ruta, f)
+                elif f.area_mm2 < cfg.area_min_oro_mm2:
+                    ruta.append(f"N4B(Brillo): A={f.area_mm2:.0f}<260mm² (rango exclusivo 2c) -> 2 céntimos")
+                    return ResultadoClasificacion(f.id_objeto, "MONEDA", "0.02 EUR", 2, ruta, f)
+                elif f.area_mm2 > cfg.area_max_oro_mm2:
                     ruta.append(f"N4B: Área fuera de rango oro ({f.area_mm2:.0f}mm²) -> INTRUSO")
                     return ResultadoClasificacion(f.id_objeto, "INTRUSO", "INTRUSO (Circular)", 0, ruta, f)
                 elif f.area_mm2 < cfg.umbral_area_10c_20c_mm2:
@@ -424,7 +489,7 @@ def clasificar_objeto_arbol(
     es_geometria_billete = (
         cfg.aspect_ratio_billete_min <= f.relacion_aspecto <= cfg.aspect_ratio_billete_max and
         f.rectangularidad >= cfg.rectangularidad_billete_min and
-        f.area_mm2 >= 5500.0
+        f.area_mm2 >= 4800.0
     )
 
     if es_geometria_billete:
@@ -434,44 +499,56 @@ def clasificar_objeto_arbol(
         )
 
         # ----------------------------------------------------------------------
-        # NODO 2 (BILLETES): Saturación (Billete Gris de 5€ vs Billetes Coloreados)
+        # NODO 2 (BILLETES): Tono Azul / Componente a* Fría (20€: 133x72mm, 9576mm²)
+        # Soporta tanto iluminación neutra (Hue en [88,136]) como luz interior cálida
+        # donde el pigmento azul sitúa a* por debajo del neutro 128 (con S >= 25)
         # ----------------------------------------------------------------------
-        if f.sat_mediana < cfg.umbral_saturacion_5e_gris and f.lado_mayor_mm < 124.5:
-            ruta.append(f"N2_B: Sat={f.sat_mediana:.1f}<{cfg.umbral_saturacion_5e_gris} y L={f.lado_mayor_mm:.1f}mm -> 5€")
-            return ResultadoClasificacion(f.id_objeto, "BILLETE", "5.00 EUR", 500, ruta, f)
-
-        # ----------------------------------------------------------------------
-        # NODO 3 (BILLETES): Tono Azul (20€) vs Cálidos (10€ Rojo / 50€ Naranja)
-        # ----------------------------------------------------------------------
-        if cfg.hue_azul_20e_min <= f.hue_mediana <= cfg.hue_azul_20e_max:
-            ruta.append(f"N3_B: Hue={f.hue_mediana:.0f} en rango Azul [92,132] y L={f.lado_mayor_mm:.1f}mm -> 20€")
+        es_azul_20e = (
+            (cfg.hue_azul_20e_min <= f.hue_mediana <= cfg.hue_azul_20e_max) or
+            (f.lab_a_interior < 128.0 and f.sat_mediana >= 25.0 and f.lado_mayor_mm >= 124.0)
+        )
+        if es_azul_20e:
+            ruta.append(f"N2_B: Hue={f.hue_mediana:.0f}/a*={f.lab_a_interior:.1f} (Azul) y L={f.lado_mayor_mm:.1f}mm -> 20€")
             return ResultadoClasificacion(f.id_objeto, "BILLETE", "20.00 EUR", 2000, ruta, f)
 
         # ----------------------------------------------------------------------
-        # NODO 4 (BILLETES): Cálidos -> 10€ (Rojo, 127mm) vs 50€ (Naranja, 140mm)
+        # NODO 3 (BILLETES): Saturación y Tamaño (Billete Gris de 5€: 120x62mm, 7440mm²)
+        # ----------------------------------------------------------------------
+        if f.sat_mediana < cfg.umbral_saturacion_5e_gris and (
+            f.lado_mayor_mm < cfg.umbral_lado_5e_10e_mm or f.area_mm2 < 7975.0
+        ):
+            ruta.append(f"N3_B: Sat={f.sat_mediana:.1f}<{cfg.umbral_saturacion_5e_gris} y A={f.area_mm2:.0f}mm² -> 5€")
+            return ResultadoClasificacion(f.id_objeto, "BILLETE", "5.00 EUR", 500, ruta, f)
+
+        # ----------------------------------------------------------------------
+        # NODO 4 (BILLETES): Cálidos -> 10€ (Rojo, 127x67mm) vs 50€ (Naranja, 140x77mm)
         # ----------------------------------------------------------------------
         if f.lado_mayor_mm < cfg.umbral_lado_10e_50e_mm and f.lab_a_interior >= cfg.umbral_lab_a_10e_vs_50e:
             ruta.append(f"N4_B: L={f.lado_mayor_mm:.1f}mm<133.5 y a*={f.lab_a_interior:.1f} (Rojo) -> 10€")
             return ResultadoClasificacion(f.id_objeto, "BILLETE", "10.00 EUR", 1000, ruta, f)
-        elif f.lado_mayor_mm >= cfg.umbral_lado_10e_50e_mm:
-            ruta.append(f"N4_B: L={f.lado_mayor_mm:.1f}mm>=133.5 (Naranja/Ocre) -> 50€")
+        elif f.lado_mayor_mm >= cfg.umbral_lado_20e_50e_mm or (f.area_mm2 >= 10000.0 and f.lab_a_interior >= 133.0):
+            ruta.append(f"N4_B: L={f.lado_mayor_mm:.1f}mm (Naranja/Ocre) -> 50€")
             return ResultadoClasificacion(f.id_objeto, "BILLETE", "50.00 EUR", 5000, ruta, f)
         else:
-            # Desempate por longitud si la iluminación altera levemente el canal a*
-            if f.lado_mayor_mm < 123.5:
-                ruta.append(f"N4_B(Aux): L={f.lado_mayor_mm:.1f}mm -> 5€")
+            # Desempate completo por área y longitud para las 4 denominaciones
+            if f.area_mm2 < 7975.0 or f.lado_mayor_mm < cfg.umbral_lado_5e_10e_mm:
+                ruta.append(f"N4_B(Aux): A={f.area_mm2:.0f}mm² / L={f.lado_mayor_mm:.1f}mm -> 5€")
                 return ResultadoClasificacion(f.id_objeto, "BILLETE", "5.00 EUR", 500, ruta, f)
-            elif f.lado_mayor_mm < cfg.umbral_lado_10e_50e_mm:
-                ruta.append(f"N4_B(Aux): L={f.lado_mayor_mm:.1f}mm -> 10€")
+            elif (f.area_mm2 < 9042.0 and f.lab_a_interior >= 134.0) or f.lado_mayor_mm < cfg.umbral_lado_10e_20e_mm:
+                ruta.append(f"N4_B(Aux): A={f.area_mm2:.0f}mm² / L={f.lado_mayor_mm:.1f}mm -> 10€")
                 return ResultadoClasificacion(f.id_objeto, "BILLETE", "10.00 EUR", 1000, ruta, f)
+            elif f.area_mm2 < 10178.0 or f.lado_mayor_mm < cfg.umbral_lado_20e_50e_mm:
+                ruta.append(f"N4_B(Aux): A={f.area_mm2:.0f}mm² / L={f.lado_mayor_mm:.1f}mm -> 20€")
+                return ResultadoClasificacion(f.id_objeto, "BILLETE", "20.00 EUR", 2000, ruta, f)
             else:
-                ruta.append(f"N4_B(Aux): L={f.lado_mayor_mm:.1f}mm -> 50€")
+                ruta.append(f"N4_B(Aux): A={f.area_mm2:.0f}mm² / L={f.lado_mayor_mm:.1f}mm -> 50€")
                 return ResultadoClasificacion(f.id_objeto, "BILLETE", "50.00 EUR", 5000, ruta, f)
 
     # --------------------------------------------------------------------------
     # DETECCIÓN DE SOLAPAMIENTO O ELEMENTOS INTRUSOS (Nivel 3 de Interpretación)
+    # Dos monedas tocándose presentan concavidad (solidez < 0.88) y forma alargada (AR > 1.25)
     # --------------------------------------------------------------------------
-    if f.solidez < cfg.umbral_solidez_minima and f.area_mm2 < 2500.0:
+    if f.solidez < cfg.umbral_solidez_minima and f.relacion_aspecto > 1.25 and f.area_mm2 < 2500.0:
         ruta.append(f"N1_Anomalía: Solidez={f.solidez:.2f}<{cfg.umbral_solidez_minima} -> MONEDAS EN CONTACTO")
         return ResultadoClasificacion(f.id_objeto, "SOLAPAMIENTO", "ALERTA: CONTACTO", 0, ruta, f)
 
@@ -509,7 +586,13 @@ def obtener_contornos_candidatos_calibracion(
     Extrae todos los contornos de la escena sin depender de la escala px/mm actual,
     para poder calibrar incluso si la escala previa era totalmente errónea.
     """
-    img_suavizada = cv2.GaussianBlur(img_bgr, (5, 5), 0)
+    h_img, w_img = img_bgr.shape[:2]
+    factor_res = max(1.0, min(h_img, w_img) / 1080.0)
+    k_blur = min(15, int(round(5 * factor_res)) | 1)
+    k_open_sz = min(15, int(round(5 * factor_res)) | 1)
+    k_close_sz = min(25, int(round(9 * factor_res)) | 1)
+
+    img_suavizada = cv2.GaussianBlur(img_bgr, (k_blur, k_blur), 0)
     img_hsv = cv2.cvtColor(img_suavizada, cv2.COLOR_BGR2HSV)
     mascara_fondo_verde = cv2.inRange(
         img_hsv,
@@ -517,20 +600,102 @@ def obtener_contornos_candidatos_calibracion(
         np.array(cfg.hsv_verde_max, dtype=np.uint8)
     )
     mascara_cruda = cv2.bitwise_not(mascara_fondo_verde)
-    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_open_sz, k_open_sz))
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_close_sz, k_close_sz))
     mascara_limpia = cv2.morphologyEx(mascara_cruda, cv2.MORPH_OPEN, kernel_open)
     mascara_limpia = cv2.morphologyEx(mascara_limpia, cv2.MORPH_CLOSE, kernel_close)
 
     contornos, _ = cv2.findContours(
         mascara_limpia, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
-    area_img = img_bgr.shape[0] * img_bgr.shape[1]
+    area_img = h_img * w_img
+    area_min_px = max(120.0, 0.00008 * area_img)
     candidatos = [
         cnt for cnt in contornos
-        if 120.0 <= cv2.contourArea(cnt) <= 0.85 * area_img
+        if area_min_px <= cv2.contourArea(cnt) <= 0.65 * area_img
+        and not _es_contorno_borde_caja(cnt, w_img, h_img)
     ]
     return candidatos
+
+
+def autoestimar_escala_imagen(
+    img_bgr: np.ndarray,
+    cfg: ConfiguracionSistema
+) -> float:
+    """
+    Estima automáticamente la escala px/mm al cargar una nueva fotografía cuando
+    la escala previa no se corresponde con la resolución de la imagen cargada.
+    Analiza los billetes y/o monedas presentes en la escena e infiere la relación
+    px/mm a partir de sus firmas cromáticas y proporciones físicas.
+    """
+    candidatos = obtener_contornos_candidatos_calibracion(img_bgr, cfg)
+    if not candidatos:
+        return cfg.px_por_mm
+
+    billetes_cand: List[np.ndarray] = []
+    monedas_cand: List[np.ndarray] = []
+
+    for cnt in candidatos:
+        area_px = float(cv2.contourArea(cnt))
+        perim_raw = float(cv2.arcLength(cnt, True))
+        cnt_s = cv2.approxPolyDP(cnt, 0.008 * perim_raw, True)
+        perim_s = float(cv2.arcLength(cnt_s, True))
+        circ = min(1.0, (4.0 * np.pi * area_px) / (perim_s ** 2 + 1e-6))
+
+        (_, _), (w_px, h_px), _ = cv2.minAreaRect(cnt)
+        lado_mayor = max(w_px, h_px)
+        lado_menor = max(min(w_px, h_px), 1.0)
+        ar = lado_mayor / lado_menor
+        rect = area_px / (lado_mayor * lado_menor + 1e-6)
+
+        if 1.48 <= ar <= 2.20 and rect >= 0.78:
+            billetes_cand.append(cnt)
+        elif circ >= 0.76 and ar <= 1.22:
+            monedas_cand.append(cnt)
+
+    # Comprobar si la escala actual ya sitúa todos los candidatos dentro del rango físico válido
+    escala_actual_area = cfg.px_por_mm ** 2
+    b_ok = all(5200.0 <= (cv2.contourArea(b) / escala_actual_area) <= 12500.0 for b in billetes_cand)
+    m_ok = all(175.0 <= (cv2.contourArea(m) / escala_actual_area) <= 580.0 for m in monedas_cand)
+    if (billetes_cand or monedas_cand) and b_ok and m_ok:
+        return cfg.px_por_mm
+
+    # Si hay billetes en la escena, estimar la escala desde cada billete según su firma cromática
+    estimaciones: List[float] = []
+    for cnt in billetes_cand:
+        feat = extraer_caracteristicas(img_bgr, cnt, 0, cfg)
+        if (cfg.hue_azul_20e_min <= feat.hue_mediana <= cfg.hue_azul_20e_max) or (
+            feat.lab_a_interior < 128.0 and feat.sat_mediana >= 25.0
+        ):
+            info = REFERENCIAS_CALIBRACION["Billete 20.00 EUR (20 euros - 133x72 mm)"]
+        elif feat.sat_mediana < cfg.umbral_saturacion_5e_gris and feat.lab_a_interior < 134.5:
+            info = REFERENCIAS_CALIBRACION["Billete 5.00 EUR (5 euros - 120x62 mm)"]
+        elif feat.lab_a_interior >= cfg.umbral_lab_a_10e_vs_50e:
+            info = REFERENCIAS_CALIBRACION["Billete 10.00 EUR (10 euros - 127x67 mm)"]
+        else:
+            info = REFERENCIAS_CALIBRACION["Billete 50.00 EUR (50 euros - 140x77 mm)"]
+        # Combinar escala por área y por lados del rectángulo rotado para máxima precisión
+        area_ref = float(info["largo_mm"]) * float(info["ancho_mm"])
+        esc_area = float(np.sqrt(feat.area_px / area_ref))
+        esc_lados = calcular_escala_desde_contorno(cnt, info)
+        estimaciones.append(0.5 * (esc_area + esc_lados))
+
+    if not estimaciones and monedas_cand:
+        monedas_cand.sort(key=cv2.contourArea)
+        cnt_mayor = monedas_cand[-1]
+        feat_m = extraer_caracteristicas(img_bgr, cnt_mayor, 0, cfg)
+        if abs(feat_m.delta_b_radial) >= cfg.umbral_gradiente_bimetalico_b:
+            diam_ref = 23.25 if feat_m.delta_b_radial < 0 else 25.75
+        elif feat_m.lab_a_interior >= cfg.umbral_cobre_lab_a or feat_m.ratio_cobre_oro >= cfg.umbral_ratio_cobre_oro:
+            diam_ref = 21.25
+        else:
+            diam_ref = 24.25
+        diam_px = 2.0 * np.sqrt(feat_m.area_px / np.pi)
+        estimaciones.append(float(diam_px / diam_ref))
+
+    if estimaciones:
+        cfg.px_por_mm = float(np.median(estimaciones))
+    return cfg.px_por_mm
 
 
 def calcular_escala_desde_contorno(
@@ -653,9 +818,15 @@ def interpretar_y_visualizar(
 ) -> Tuple[np.ndarray, Dict]:
     """
     Realiza el análisis de Nivel 3 (conteo por denominación, suma monetaria exacta,
-    detección de anomalías) y dibuja un panel HUD sobre la escena.
+    detección de anomalías) y dibuja un panel HUD y etiquetas escaladas dinámicamente
+    a la resolución de la imagen para que siempre se vean grandes y nítidas.
     """
     canvas = img_bgr.copy()
+    h_img, w_img = canvas.shape[:2]
+    # Factor de escala visual proporcional a la resolución de la imagen
+    escala_ui = max(1.0, max(w_img, h_img) / 1080.0)
+    grosor_linea = max(2, int(round(3.0 * escala_ui)))
+
     total_centimos = 0
     num_monedas = 0
     num_billetes = 0
@@ -664,9 +835,9 @@ def interpretar_y_visualizar(
 
     colores_cat = {
         "MONEDA": (0, 230, 255),       # Amarillo/Dorado en BGR
-        "BILLETE": (255, 205, 50),     # Azul claro en BGR
+        "BILLETE": (255, 215, 40),     # Azul celeste brillante en BGR
         "SOLAPAMIENTO": (0, 140, 255), # Naranja alerta
-        "INTRUSO": (40, 40, 255)       # Rojo puro
+        "INTRUSO": (50, 50, 255)       # Rojo puro
     }
 
     for res in resultados:
@@ -689,66 +860,103 @@ def interpretar_y_visualizar(
         # Dibujo geométrico según el tipo de objeto
         if res.categoria == "MONEDA":
             r_px = int(np.sqrt(f.area_px / np.pi))
-            cv2.circle(canvas, (cx, cy), r_px, color, 2, cv2.LINE_AA)
+            cv2.circle(canvas, (cx, cy), r_px, color, grosor_linea, cv2.LINE_AA)
             # Anillo de análisis zonal (núcleo/corona)
-            cv2.circle(canvas, (cx, cy), int(0.50 * r_px), (210, 210, 210), 1, cv2.LINE_AA)
-            y_label = cy - r_px - 18
+            cv2.circle(
+                canvas, (cx, cy), int(0.50 * r_px),
+                (220, 220, 220), max(1, grosor_linea // 2), cv2.LINE_AA
+            )
+            y_anchor = max(int(180 * escala_ui), cy - r_px - int(16 * escala_ui))
         else:
             box = np.int32(cv2.boxPoints(f.caja_rotada))
-            cv2.drawContours(canvas, [box], 0, color, 2, cv2.LINE_AA)
-            y_label = cy - 8
+            cv2.drawContours(canvas, [box], 0, color, grosor_linea + 1, cv2.LINE_AA)
+            y_anchor = cy
 
-        cv2.circle(canvas, (cx, cy), 3, (0, 0, 255), -1)
+        cv2.circle(canvas, (cx, cy), max(4, int(5 * escala_ui)), (0, 0, 255), -1)
 
-        texto_principal = f"#{res.id_objeto} {res.etiqueta}"
-        texto_secundario = f"{f.area_mm2:.0f}mm2 | C:{f.circularidad:.2f}"
+        # Etiqueta grande con fondo oscuro de alto contraste sobre cada moneda y billete
+        texto_valor = f"#{res.id_objeto}  {res.etiqueta}"
+        texto_detalle = f"{f.area_mm2:.0f} mm2 ({f.lado_mayor_mm:.1f}mm)"
+
+        font_scale_val = 0.82 * escala_ui
+        font_scale_det = 0.52 * escala_ui
+        thick_val = max(2, int(round(2.3 * escala_ui)))
+        thick_det = max(1, int(round(1.5 * escala_ui)))
+
+        (tw1, th1), _ = cv2.getTextSize(texto_valor, cv2.FONT_HERSHEY_SIMPLEX, font_scale_val, thick_val)
+        (tw2, th2), _ = cv2.getTextSize(texto_detalle, cv2.FONT_HERSHEY_SIMPLEX, font_scale_det, thick_det)
+
+        pad_x = int(12 * escala_ui)
+        pad_y = int(8 * escala_ui)
+        box_w = max(tw1, tw2) + 2 * pad_x
+        box_h = th1 + th2 + 3 * pad_y
+
+        x1 = int(np.clip(cx - box_w // 2, 10, max(12, w_img - box_w - 10)))
+        y1 = int(np.clip(y_anchor - box_h, 10, max(12, h_img - box_h - 10)))
+        x2 = x1 + box_w
+        y2 = y1 + box_h
+
+        # Fondo semitransparente oscuro con borde del color de la categoría
+        sub_roi = canvas[y1:y2, x1:x2]
+        if sub_roi.size > 0:
+            fondo_etq = np.full_like(sub_roi, (18, 22, 28))
+            cv2.addWeighted(fondo_etq, 0.85, sub_roi, 0.15, 0, sub_roi)
+            canvas[y1:y2, x1:x2] = sub_roi
+
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), color, max(2, int(2 * escala_ui)), cv2.LINE_AA)
+
         cv2.putText(
-            canvas, texto_principal, (cx - 48, y_label),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 0), 3, cv2.LINE_AA
+            canvas, texto_valor,
+            (x1 + pad_x, y1 + pad_y + th1),
+            cv2.FONT_HERSHEY_SIMPLEX, font_scale_val, color, thick_val, cv2.LINE_AA
         )
         cv2.putText(
-            canvas, texto_principal, (cx - 48, y_label),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1, cv2.LINE_AA
-        )
-        cv2.putText(
-            canvas, texto_secundario, (cx - 48, y_label + 16),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (235, 235, 235), 1, cv2.LINE_AA
+            canvas, texto_detalle,
+            (x1 + pad_x, y1 + 2 * pad_y + th1 + th2),
+            cv2.FONT_HERSHEY_SIMPLEX, font_scale_det, (235, 240, 245), thick_det, cv2.LINE_AA
         )
 
-    # --- Panel HUD Superior de Interpretación de la Escena ---
-    alto_hud = 128
+    # --- Panel HUD Superior de Interpretación de la Escena (Escalado a la Resolución) ---
+    margen_hud = int(14 * escala_ui)
+    alto_hud = int(165 * escala_ui)
+    y2_hud = min(h_img - 10, alto_hud)
+
     overlay = canvas.copy()
-    cv2.rectangle(overlay, (10, 10), (canvas.shape[1] - 10, alto_hud), (18, 26, 18), -1)
-    cv2.addWeighted(overlay, 0.84, canvas, 0.16, 0, canvas)
-    cv2.rectangle(canvas, (10, 10), (canvas.shape[1] - 10, alto_hud), (0, 220, 120), 1)
+    cv2.rectangle(overlay, (margen_hud, margen_hud), (w_img - margen_hud, y2_hud), (15, 22, 18), -1)
+    cv2.addWeighted(overlay, 0.88, canvas, 0.12, 0, canvas)
+    cv2.rectangle(
+        canvas, (margen_hud, margen_hud), (w_img - margen_hud, y2_hud),
+        (0, 230, 130), max(2, int(2.5 * escala_ui))
+    )
 
     total_euros = total_centimos / 100.0
+    x_txt = margen_hud + int(22 * escala_ui)
+
+    # Título gigante con el IMPORTE TOTAL
     cv2.putText(
         canvas,
         f"IMPORTE TOTAL: {total_euros:.2f} EUR",
-        (25, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 140), 2, cv2.LINE_AA
+        (x_txt, margen_hud + int(52 * escala_ui)),
+        cv2.FONT_HERSHEY_SIMPLEX, 1.35 * escala_ui, (0, 255, 140),
+        max(3, int(round(3.5 * escala_ui))), cv2.LINE_AA
     )
     cv2.putText(
         canvas,
-        f"Monedas: {num_monedas} | Billetes: {num_billetes} | Alertas/Intrusos: {num_alertas} | Escala: {cfg.px_por_mm:.2f} px/mm",
-        (25, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (225, 225, 225), 1, cv2.LINE_AA
+        f"Monedas: {num_monedas}  |  Billetes: {num_billetes}  |  Alertas: {num_alertas}  |  Escala: {cfg.px_por_mm:.2f} px/mm",
+        (x_txt, margen_hud + int(94 * escala_ui)),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.68 * escala_ui, (235, 235, 235),
+        max(1, int(round(1.8 * escala_ui))), cv2.LINE_AA
     )
 
-    # Formateo compacto del inventario para evitar que se corte en pantalla
-    items_inv = [f"{k.replace(' EUR', 'E')}: x{v}" for k, v in sorted(desglose.items())]
-    mitad = (len(items_inv) + 1) // 2
-    linea_inv_1 = "Inventario: " + (" | ".join(items_inv[:mitad]) if items_inv else "Vacío")
-    linea_inv_2 = "            " + (" | ".join(items_inv[mitad:]) if len(items_inv) > mitad else "")
-
+    # Inventario detallado con fuente grande
+    items_inv = [f"{k}: x{v}" for k, v in sorted(desglose.items())]
+    linea_inv = "Valores detectados:  " + ("   |   ".join(items_inv) if items_inv else "Ninguno")
     cv2.putText(
-        canvas, linea_inv_1, (25, 95),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.46, (180, 235, 255), 1, cv2.LINE_AA
+        canvas, linea_inv,
+        (x_txt, margen_hud + int(134 * escala_ui)),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.66 * escala_ui, (140, 235, 255),
+        max(1, int(round(1.8 * escala_ui))), cv2.LINE_AA
     )
-    if linea_inv_2.strip():
-        cv2.putText(
-            canvas, linea_inv_2, (25, 116),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.46, (180, 235, 255), 1, cv2.LINE_AA
-        )
 
     resumen = {
         "total_euros": total_euros,
@@ -1027,32 +1235,45 @@ class InterfazMonedasBilletes:
         self.canvas_img.bind("<Configure>", lambda _: self._actualizar_lienzo())
         self.canvas_img.bind("<Button-1>", self._al_hacer_clic_lienzo)
 
-        # Panel lateral derecho: Resumen contable y traza del árbol de decisión
-        frame_info = tk.Frame(panel_central, bg="#181d23", padx=12, pady=12)
-        panel_central.add(frame_info, minsize=360, stretch="never")
+        # Panel lateral derecho: Resumen contable gigante y traza del árbol de decisión
+        frame_info = tk.Frame(panel_central, bg="#181d23", padx=14, pady=14)
+        panel_central.add(frame_info, minsize=450, stretch="never")
 
         tk.Label(
-            frame_info, text="RESUMEN DE LA ESCENA",
-            bg="#181d23", fg="#00cec9", font=("Segoe UI", 11, "bold")
+            frame_info, text="SUMA TOTAL E INVENTARIO",
+            bg="#181d23", fg="#00cec9", font=("Segoe UI", 12, "bold")
         ).pack(anchor="w", pady=(0, 6))
 
         self.lbl_importe = tk.Label(
             frame_info, text="IMPORTE TOTAL: 0.00 EUR",
-            bg="#111519", fg="#00ff8c", font=("Segoe UI", 16, "bold"),
-            padx=12, pady=10, anchor="w"
+            bg="#0d1117", fg="#00ff8c", font=("Segoe UI", 22, "bold"),
+            padx=16, pady=14, anchor="center", relief=tk.SOLID, bd=1
         )
         self.lbl_importe.pack(fill=tk.X, pady=(0, 8))
 
         self.lbl_conteo = tk.Label(
-            frame_info, text="Monedas: 0 | Billetes: 0 | Alertas: 0",
-            bg="#181d23", fg="#dfe6e9", font=("Segoe UI", 10), anchor="w"
+            frame_info, text="Monedas: 0  |  Billetes: 0  |  Alertas: 0",
+            bg="#181d23", fg="#ffffff", font=("Segoe UI", 12, "bold"), anchor="w"
         )
-        self.lbl_conteo.pack(fill=tk.X, pady=(0, 10))
+        self.lbl_conteo.pack(fill=tk.X, pady=(0, 8))
 
         tk.Label(
-            frame_info, text="TRAZA DEL ÁRBOL DE DECISIÓN E INVENTARIO",
+            frame_info, text="VALOR DE CADA MONEDA Y BILLETE DETECTADO",
+            bg="#181d23", fg="#fdcb6e", font=("Segoe UI", 11, "bold")
+        ).pack(anchor="w", pady=(2, 4))
+
+        self.lbl_desglose_grande = tk.Label(
+            frame_info,
+            text="(Selecciona una imagen para ver el desglose de valores)",
+            bg="#111519", fg="#81ecec", font=("Consolas", 13, "bold"),
+            padx=12, pady=10, justify=tk.LEFT, anchor="w"
+        )
+        self.lbl_desglose_grande.pack(fill=tk.X, pady=(0, 12))
+
+        tk.Label(
+            frame_info, text="DETALLE INDIVIDUAL Y TRAZA DEL ÁRBOL",
             bg="#181d23", fg="#00cec9", font=("Segoe UI", 10, "bold")
-        ).pack(anchor="w", pady=(4, 4))
+        ).pack(anchor="w", pady=(2, 4))
 
         frame_texto = tk.Frame(frame_info, bg="#111519")
         frame_texto.pack(fill=tk.BOTH, expand=True)
@@ -1060,8 +1281,8 @@ class InterfazMonedasBilletes:
         scrollbar = ttk.Scrollbar(frame_texto, orient=tk.VERTICAL)
         self.txt_traza = tk.Text(
             frame_texto, bg="#111519", fg="#dfe6e9",
-            font=("Consolas", 9), wrap=tk.WORD,
-            yscrollcommand=scrollbar.set, relief=tk.FLAT, padx=8, pady=8
+            font=("Consolas", 10), wrap=tk.WORD,
+            yscrollcommand=scrollbar.set, relief=tk.FLAT, padx=10, pady=10
         )
         scrollbar.config(command=self.txt_traza.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1086,7 +1307,7 @@ class InterfazMonedasBilletes:
             self._mostrar_mensaje_bienvenida()
 
     def cargar_desde_ruta(self, ruta: str):
-        """Lee la imagen seleccionada en el explorador y ejecuta el análisis."""
+        """Lee la imagen seleccionada en el explorador, autoestima su escala y ejecuta el análisis."""
         img = leer_imagen_unicode(ruta)
         if img is None:
             messagebox.showerror(
@@ -1099,11 +1320,16 @@ class InterfazMonedasBilletes:
         nombre = os.path.basename(ruta)
         self.lbl_archivo.config(text=f"Archivo: {nombre} ({img.shape[1]}x{img.shape[0]} px)")
         self.img_original = img
+        # Autoestimar escala px/mm para que fotos de móvil (4K, 12MP, 200MP) funcionen al instante
+        escala_est = autoestimar_escala_imagen(self.img_original, self.cfg)
+        self.var_escala.set(round(escala_est, 3))
         self._ejecutar_analisis()
 
     def cargar_escena_sintetica(self):
         """Genera y analiza la escena sintética de referencia."""
         self.ruta_actual = None
+        self.cfg.px_por_mm = 2.16
+        self.var_escala.set(2.16)
         self.img_original = generar_escena_sintetica_prueba(self.cfg)
         self.lbl_archivo.config(
             text=f"Escena sintética de prueba ({self.img_original.shape[1]}x{self.img_original.shape[0]} px)"
@@ -1435,24 +1661,41 @@ class InterfazMonedasBilletes:
         )
         print("-" * 80)
 
-        # Actualizar indicadores del panel derecho
-        self.lbl_importe.config(text=f"IMPORTE TOTAL: {self.resumen['total_euros']:.2f} EUR")
+        # Actualizar indicadores grandes del panel derecho
+        self.lbl_importe.config(text=f"TOTAL: {self.resumen['total_euros']:.2f} EUR")
         self.lbl_conteo.config(
             text=(
-                f"Monedas: {self.resumen['num_monedas']}  |  "
-                f"Billetes: {self.resumen['num_billetes']}  |  "
-                f"Alertas/Intrusos: {self.resumen['num_alertas']}"
+                f"Monedas: {self.resumen['num_monedas']}   |   "
+                f"Billetes: {self.resumen['num_billetes']}   |   "
+                f"Alertas: {self.resumen['num_alertas']}"
             )
         )
 
-        # Construir el texto de desglose y traza por objeto
-        lineas = []
-        lineas.append("=== DESGLOSE POR DENOMINACIÓN ===")
+        # Panel grande con el valor de cada denominación y su subtotal
         if self.resumen["desglose"]:
-            for etq, cant in sorted(self.resumen["desglose"].items()):
-                lineas.append(f"  • {etq:10s} : {cant} ud(s)")
+            lineas_desglose = []
+            # Ordenar por valor monetario descendente
+            items_ord = sorted(
+                self.resumen["desglose"].items(),
+                key=lambda kv: float(kv[0].replace(" EUR", "")),
+                reverse=True
+            )
+            for etq, cant in items_ord:
+                val_unit = float(etq.replace(" EUR", ""))
+                subtotal = val_unit * cant
+                tipo_icono = "💵" if val_unit >= 5.0 else "🪙"
+                lineas_desglose.append(
+                    f"{tipo_icono} {etq:9s} x {cant:<2d} = {subtotal:6.2f} EUR"
+                )
+            self.lbl_desglose_grande.config(text="\n".join(lineas_desglose))
         else:
-            lineas.append("  (Sin objetos válidos clasificados)")
+            self.lbl_desglose_grande.config(text="(Sin monedas ni billetes detectados)")
+
+        # Construir el listado individual grande y la traza por objeto
+        lineas = []
+        lineas.append("=== OBJETOS DETECTADOS EN LA ESCENA ===")
+        for res in self.resultados:
+            lineas.append(f"  #{res.id_objeto:02d} -> {res.etiqueta:10s} ({res.categoria})")
 
         lineas.append("\n=== TRAZA DEL ÁRBOL DE DECISIÓN ===")
         for res in self.resultados:
@@ -1596,6 +1839,7 @@ def main():
             img_entrada = leer_imagen_unicode(args.imagen)
             if img_entrada is None:
                 raise FileNotFoundError(f"No se pudo abrir la imagen: {args.imagen}")
+            autoestimar_escala_imagen(img_entrada, cfg)
         else:
             print("Generando escena sintética de validación con las 8 monedas y 4 billetes...")
             img_entrada = generar_escena_sintetica_prueba(cfg)

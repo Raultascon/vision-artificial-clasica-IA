@@ -1,3 +1,23 @@
+# Entornos virtuales
 .venv/
+venv/
+ENV/
+
+# Caché y compilados de Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+
+# Carpetas de pruebas locales y capturas pesadas
+Fotos/
+*.jpg
+*.jpeg
+*.png
+
+# Archivos de sistema y editores
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store
