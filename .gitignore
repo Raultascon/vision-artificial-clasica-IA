@@ -9,12 +9,6 @@ __pycache__/
 *$py.class
 *.so
 
-# Carpetas de pruebas locales y capturas pesadas
-Fotos/
-*.jpg
-*.jpeg
-*.png
-
 # Archivos de sistema y editores
 .vscode/
 .idea/
